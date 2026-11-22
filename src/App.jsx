@@ -1,0 +1,155 @@
+import { useState } from 'react'
+import './App.css'
+
+const empty = { schools: [], teachers: [], students: [], classes: [], timetable: [], marks: [], attendance: [] }
+const load = () => { try { return { ...empty, ...JSON.parse(localStorage.getItem('classledger') || '{}') } } catch { return empty } }
+const id = () => crypto.randomUUID()
+const nameOf = x => [x.firstName, x.lastName].filter(Boolean).join(' ')
+const initials = s => (s || '?').split(/\s+/).slice(0, 2).map(x => x[0]).join('').toUpperCase()
+
+export default function App() {
+  const [data, setData] = useState(load)
+  const [user, setUser] = useState(() => { try { return JSON.parse(sessionStorage.getItem('classledger-user') || 'null') } catch { return null } })
+  const [page, setPage] = useState('Overview')
+  const [modal, setModal] = useState('')
+  const [search, setSearch] = useState('')
+  const [notice, setNotice] = useState('')
+  const [menuOpen, setMenuOpen] = useState(false)
+  const [editing, setEditing] = useState(null)
+  const role = user?.role || 'admin'
+  const schoolId = role === 'school' ? user?.id : user?.schoolId
+  const school = data.schools.find(s => s.id === schoolId)
+  const scope = list => role === 'admin' ? list : list.filter(x => x.schoolId === schoolId)
+  const schools = data.schools
+  const teachers = scope(data.teachers)
+  const classes = role === 'student' ? data.classes.filter(c => c.id === user.classId) : role === 'teacher' ? scope(data.classes).filter(c => (c.teacherIds || (c.teacherId ? [c.teacherId] : [])).includes(user.id)) : scope(data.classes)
+  const students = role === 'student' ? data.students.filter(s => s.id === user.id) : role === 'teacher' ? scope(data.students).filter(s => classes.some(c => c.id === s.classId)) : scope(data.students)
+  const nav = role === 'admin' ? ['Overview', 'Schools'] : role === 'school' ? ['Overview', 'Classes', 'Teachers', 'Students', 'Timetable'] : role === 'teacher' ? ['Overview', 'My classes', 'Timetable', 'Attendance', 'Marks'] : ['Overview', 'My timetable', 'My attendance', 'My marks']
+  const persist = next => { setData(next); localStorage.setItem('classledger', JSON.stringify(next)) }
+  const login = e => {
+    e.preventDefault()
+    const { username, password } = Object.fromEntries(new FormData(e.currentTarget))
+    const account = username === 'admin' && password === (data.adminPassword || 'password') ? { id: 'admin', role: 'admin', name: 'System admin' } : [...data.schools, ...data.teachers, ...data.students].find(x => x.username === username && x.password === password)
+    if (!account) { setNotice('Username or password is incorrect.'); return }
+    setNotice(''); setUser(account); sessionStorage.setItem('classledger-user', JSON.stringify(account)); setPage('Overview')
+  }
+  const logout = () => { setUser(null); sessionStorage.removeItem('classledger-user'); setPage('Overview') }
+  const save = (kind, item, recordId = null) => {
+    const key = { school: 'schools', teacher: 'teachers', student: 'students', class: 'classes', lesson: 'timetable', mark: 'marks', attendance: 'attendance' }[kind]
+    const oldRecord = recordId ? data[key].find(x => x.id === recordId) : null
+    const record = { ...oldRecord, ...item, id: recordId || id(), schoolId: item.schoolId || oldRecord?.schoolId || schoolId }
+    if (kind === 'school') record.schoolId = record.id
+    const next = { ...data, [key]: recordId ? data[key].map(x => x.id === recordId ? record : x) : [...data[key], record] }
+    if (kind === 'attendance') {
+      const affected = new Set([item.studentId, oldRecord?.studentId].filter(Boolean))
+      next.students = next.students.map(s => {
+        if (!affected.has(s.id)) return s
+        const attendance = next.attendance.filter(a => a.studentId === s.id)
+        const present = attendance.filter(a => a.status !== 'Absent').length
+        return { ...s, attendanceRate: attendance.length ? Math.round(present / attendance.length * 100) : 0 }
+      })
+    }
+    persist(next); setModal(''); setEditing(null); setNotice(`${kind[0].toUpperCase()}${kind.slice(1)} ${recordId ? 'updated' : 'saved'}.`); setTimeout(() => setNotice(''), 2500)
+  }
+  const edit = (kind, record) => { setEditing(record); setModal(kind) }
+  const remove = (kind, record) => {
+    if (!window.confirm(`Delete this ${kind}? Related records may also be removed.`)) return
+    const next = { ...data }
+    const key = { school: 'schools', teacher: 'teachers', student: 'students', class: 'classes', lesson: 'timetable', mark: 'marks', attendance: 'attendance' }[kind]
+    next[key] = next[key].filter(x => x.id !== record.id)
+    if (kind === 'school') {
+      for (const k of ['teachers', 'students', 'classes', 'timetable', 'marks', 'attendance']) next[k] = next[k].filter(x => x.schoolId !== record.id)
+    } else if (kind === 'teacher') {
+      next.classes = next.classes.map(c => ({ ...c, teacherIds: (c.teacherIds || (c.teacherId ? [c.teacherId] : [])).filter(tid => tid !== record.id), teacherId: c.teacherId === record.id ? undefined : c.teacherId }))
+      next.timetable = next.timetable.map(t => t.teacherId === record.id || t.teacher === nameOf(record) ? { ...t, teacherId: undefined, teacher: '' } : t)
+    } else if (kind === 'class') {
+      next.students = next.students.map(s => s.classId === record.id ? { ...s, classId: '' } : s)
+      next.timetable = next.timetable.filter(t => t.classId !== record.id)
+      next.attendance = next.attendance.filter(a => a.classId !== record.id)
+    } else if (kind === 'student') {
+      next.marks = next.marks.filter(x => x.studentId !== record.id)
+      next.attendance = next.attendance.filter(x => x.studentId !== record.id)
+    }
+    persist(next); setNotice(`${kind[0].toUpperCase()}${kind.slice(1)} deleted.`); setTimeout(() => setNotice(''), 2500)
+  }
+  const changeOwnPassword = password => {
+    if (role === 'admin') persist({ ...data, adminPassword: password })
+    else {
+      const key = role === 'school' ? 'schools' : role === 'teacher' ? 'teachers' : 'students'
+      persist({ ...data, [key]: data[key].map(account => account.id === user.id ? { ...account, password } : account) })
+    }
+    setModal(''); setNotice('Your password has been changed.'); setTimeout(() => setNotice(''), 2500)
+  }
+  const canManage = (kind, record) => (role === 'admin' && kind === 'school') || (role === 'school' && kind !== 'school' && record.schoolId === schoolId) || (role === 'teacher' && ((kind === 'lesson' && classes.some(c => c.id === record.classId)) || (kind === 'attendance' && classes.some(c => c.id === record.classId)) || (kind === 'mark' && students.some(s => s.id === record.studentId))))
+  const openCreate = () => setModal(({ Schools: 'school', Teachers: 'teacher', Students: 'student', Classes: 'class', 'My classes': 'class', Timetable: 'lesson', 'My timetable': 'lesson', Attendance: 'attendance', 'My attendance': 'attendance', Marks: 'mark', 'My marks': 'mark' })[page] || (role === 'admin' ? 'school' : role === 'school' ? 'student' : role === 'teacher' ? 'attendance' : ''))
+  if (!user) return <Login onSubmit={login} error={notice} />
+
+  const section = page === 'Overview' ? 'Your school, in sync' : page
+  const lists = { Schools: schools, Teachers: teachers, Students: students, Classes: classes, 'My classes': classes,
+    Timetable: data.timetable.filter(x => role === 'teacher' ? classes.some(c => c.id === x.classId) : role === 'admin' ? true : x.schoolId === schoolId), 'My timetable': data.timetable.filter(x => role === 'student' ? x.classId === user.classId : classes.some(c => c.id === x.classId)),
+    Attendance: data.attendance.filter(x => role === 'admin' || (role === 'teacher' ? classes.some(c => c.id === x.classId) : x.schoolId === schoolId)), 'My attendance': data.attendance.filter(x => x.studentId === user.id),
+    Marks: data.marks.filter(x => role === 'admin' || (role === 'teacher' ? students.some(s => s.id === x.studentId) : x.schoolId === schoolId)), 'My marks': data.marks.filter(x => x.studentId === user.id) }
+  const rows = (lists[page] || []).filter(x => JSON.stringify(x).toLowerCase().includes(search.toLowerCase()))
+  const canAdd = role !== 'student'
+  return <div className="shell">
+    <aside className={`sidebar ${menuOpen ? 'open' : ''}`}><a className="brand" href="#home"><span className="brand-symbol">C</span> classledger</a><div className="workspace-label">WORKSPACE</div><div className="workspace"><span className="workspace-icon">{role === 'admin' ? '✦' : initials(school?.name)}</span><span><b>{role === 'admin' ? 'System admin' : school?.name || 'School'}</b><small>{role === 'admin' ? 'Platform workspace' : `${role} workspace`}</small></span><span className="chevron">⌄</span></div><div className="menu-label">MENU</div><nav>{nav.map((item, i) => <button key={item} className={`nav-item ${page === item ? 'selected' : ''}`} onClick={() => { setPage(item); setSearch(''); setMenuOpen(false) }}><span className="nav-icon">{['◫', '▦', '♧', '♙', '▤', '◷'][i % 6]}</span>{item}{item === 'Schools' && <small className="count">{schools.length}</small>}</button>)}</nav><div className="side-bottom"><div className="tip-card"><span className="tip-icon">✳</span><b>A little help goes a long way</b><p>Set up your school community one step at a time.</p></div><button className="account" onClick={() => setModal('password')}><span className="avatar">{initials(user.name || nameOf(user))}</span><span><b>{user.name || nameOf(user) || 'System admin'}</b><small>{role} · Change password</small></span><span className="exit">⚿</span></button><button className="signout-link" onClick={logout}>Sign out ↗</button></div></aside>
+    {menuOpen && <button className="nav-backdrop" aria-label="Close navigation" onClick={() => setMenuOpen(false)} />}
+    <main className="main"><header className="topbar"><button className="menu-trigger" aria-label="Open navigation" onClick={() => setMenuOpen(true)}>☰</button><div className="breadcrumbs">ClassLedger <span>›</span> <b>{page}</b></div><div className="today">◷ &nbsp;{new Intl.DateTimeFormat('en', { weekday: 'short', month: 'short', day: 'numeric' }).format(new Date())}<span className="avatar mini">{initials(user.name || nameOf(user))}</span></div></header>
+      <div className="page"><div className="page-head"><div><div className="overline">{page === 'Overview' ? 'A CALMER WAY TO MANAGE SCHOOL' : `CLASSLEDGER  /  ${role.toUpperCase()}`}</div><h1>{page === 'Overview' ? `Good morning${role === 'admin' ? '' : `, ${(user.firstName || user.name || 'there').split(' ')[0]}`}` : section}<span className="sparkle">✳</span></h1><p>{page === 'Overview' ? role === 'admin' ? 'Here’s what’s happening across your schools.' : `A clear view of what’s happening at ${school?.name || 'your school'}.` : `Manage ${page.toLowerCase()} in one place.`}</p></div>{canAdd && <button className="button primary" onClick={openCreate}><span>＋</span>{page === 'Overview' ? role === 'admin' ? 'Onboard a school' : role === 'school' ? 'Add a student' : role === 'teacher' ? 'Take attendance' : 'Add' : ({ Schools: 'Onboard a school', Teachers: 'Add a teacher', Students: 'Add a student', Classes: 'Create a class', 'My classes': 'Create a class', Timetable: 'Add a lesson', 'My timetable': 'Add a lesson', Attendance: 'Take attendance', Marks: 'Add marks' })[page] || 'Add record'}</button>}</div>
+      {page === 'Overview' ? <Dashboard data={data} role={role} schools={schools} teachers={teachers} students={students} classes={classes} user={user} changePage={setPage} create={setModal} /> : <Directory page={page} rows={rows} data={data} role={role} onSearch={setSearch} search={search} canManage={canManage} onEdit={edit} onDelete={remove} />}
+      <footer>© {new Date().getFullYear()} ClassLedger <span>Thoughtfully built for school communities <b>✳</b></span></footer>
+    </div></main>
+    {modal === 'password' && <PasswordModal role={role} user={user} data={data} onClose={() => setModal('')} onSave={changeOwnPassword} />}
+    {modal && modal !== 'password' && <CreateModal key={`${modal}-${editing?.id || 'new'}`} kind={modal} data={data} user={user} role={role} schoolId={schoolId} record={editing} onClose={() => { setModal(''); setEditing(null) }} onSave={save} />}
+    {notice && <div className="toast"><span>✓</span>{notice}</div>}
+  </div>
+}
+
+function Login({ onSubmit, error }) {
+  return <main className="login"><section className="login-art"><a className="brand inverse"><span className="brand-symbol">C</span> classledger</a><div className="art-content"><div className="overline">SCHOOL, IN SYNC</div><h1>Make room<br />for <em>better</em><br />learning.</h1><p>One calm place for the people and progress that make a school.</p></div><div className="art-foot"><div className="avatar-stack"><i>AM</i><i>SK</i><i>JR</i><i>+</i></div>Made for every part of school life</div><div className="art-orbit"/></section><section className="login-panel"><form className="login-form" onSubmit={onSubmit}><a className="brand"><span className="brand-symbol">C</span> classledger</a><div className="overline">WELCOME BACK</div><h2>Your school,<br />all in one place.</h2><p>Sign in to your ClassLedger workspace.</p><label>Username<input name="username" placeholder="Enter your username" autoComplete="username" required /></label><label>Password<input name="password" type="password" placeholder="Enter your password" autoComplete="current-password" required /></label>{error && <div className="error">{error}</div>}<button className="button primary sign-in">Sign in <span>↗</span></button><div className="login-safe">✧ &nbsp; Secure access for school communities</div><div className="credential">First time here?<br />System admin: <b>admin</b> · Password: <b>password</b></div></form><footer>© {new Date().getFullYear()} ClassLedger <span>Made for the moments that matter</span></footer></section></main>
+}
+
+function Dashboard({ data, role, schools, teachers, students, classes, user, changePage, create }) {
+  const ownMarks = data.marks.filter(m => m.studentId === user.id)
+  const metrics = role === 'admin' ? [['Schools', schools.length, '▦', 'Schools in your network']] : role === 'student' ? [['Attendance', `${students[0]?.attendanceRate || 0}%`, '◷', 'Your attendance this term'], ['Marks', ownMarks.length, '↗', 'Subjects with marks'], ['Timetable', data.timetable.filter(t => t.classId === user.classId).length, '▤', 'Lessons on your timetable'], ['Class', classes[0]?.name || '—', '▦', 'Your current class']] : [['Students', students.length, '♙', 'Enrolled students'], ['Teachers', teachers.length, '♧', 'Teaching team'], ['Classes', classes.length, '▤', 'Active classes'], ['Lessons', data.timetable.length, '◷', 'On the timetable']]
+  const visibleSchools = schools.slice(0, 4)
+  return <><div className="metrics">{metrics.map(([label, value, icon, hint], i) => <button className="metric" key={label} onClick={() => label === 'Schools' ? changePage('Schools') : changePage(({ 'Attendance': 'My attendance', Marks: 'My marks', Timetable: 'My timetable' })[label] || 'Students')}><span className={`metric-icon tone-${i}`}>{icon}</span><span className="metric-value">{value}</span><b>{label}</b><small>{hint}</small>{role !== 'admin' && <span className="metric-arrow">↗</span>}</button>)}</div><div className="dashboard-grid"><section className="card network"><div className="card-head"><div><h2>{role === 'admin' ? 'School network' : role === 'student' ? 'Your progress' : 'Your students'}</h2><p>{role === 'admin' ? 'Your schools, all together.' : 'A recent snapshot from your workspace.'}</p></div><button className="link-button" onClick={() => changePage(role === 'admin' ? 'Schools' : role === 'student' ? 'My marks' : 'Students')}>View all ↗</button></div>{role === 'admin' ? visibleSchools.length ? visibleSchools.map((s, i) => <div className="school-row" key={s.id}><span className={`school-badge tone-${i}`}>{initials(s.name)}</span><span className="row-copy"><b>{s.name}</b><small>{s.location || 'Location not set'} · {s.email}</small></span><span className="active-pill">● Active</span><span className="row-more">···</span></div>) : <EmptyState title="Your school network starts here" text="Onboard a school to bring its community into ClassLedger." action="Onboard a school" onClick={() => create('school')} /> : role === 'student' ? <div className="student-progress"><div><small>TERM ATTENDANCE</small><b>{students[0]?.attendanceRate || 0}<i>%</i></b><div className="progress"><span style={{ width: `${students[0]?.attendanceRate || 0}%` }} /></div><small>Every school day is a fresh start.</small></div><div><small>RECENT MARKS</small>{ownMarks.length ? ownMarks.slice(-3).reverse().map(m => <p className="score-row" key={m.id}>{m.subject}<b>{m.score}/{m.outOf}</b></p>) : <p className="light-text">Your marks will appear here.</p>}</div></div> : students.length ? students.slice(-5).reverse().map((s, i) => <div className="student-row" key={s.id}><span className={`person-avatar tone-${i}`}>{initials(nameOf(s))}</span><span className="row-copy"><b>{nameOf(s)}</b><small>{classes.find(c => c.id === s.classId)?.name || 'Unassigned class'}</small></span><span className="active-pill">{s.attendanceRate || 0}% attendance</span></div>) : <EmptyState title="Your student community starts here" text="Add your first student to get their school journey started." action="Add a student" onClick={() => create('student')} />}</section>{role === 'admin' ? <section className="card timetable-card"><div className="card-head"><div><h2>Onboard schools</h2><p>Build your school network.</p></div><span className="today-chip">{schools.length} schools</span></div><div className="setup-panel"><span>✳</span><b>Each school manages its own community</b><p>School managers handle teachers, students, classes, and timetables in their school workspace.</p><button className="link-button" onClick={() => create('school')}>Onboard a school ↗</button></div></section> : <section className="card timetable-card"><div className="card-head"><div><h2>On the timetable</h2><p>{role === 'student' ? 'Your upcoming lessons.' : 'A little structure for the week.'}</p></div><span className="today-chip">◷ Today</span></div>{data.timetable.filter(t => role === 'student' ? t.classId === user.classId : classes.some(c => c.id === t.classId)).slice(0, 4).map((t, i) => <div className="lesson-row" key={t.id}><span className="lesson-time">{t.time}<small>{t.endTime}</small></span><i className={`lesson-bar tone-${i}`} /><span className="row-copy"><b>{t.subject}</b><small>{classes.find(c => c.id === t.classId)?.name || 'Class'}{t.teacher ? ` · ${t.teacher}` : ''}</small></span><span className="row-more">›</span></div>)}{!data.timetable.some(t => role === 'student' ? t.classId === user.classId : classes.some(c => c.id === t.classId)) && <EmptyState title="No lessons on the board yet" text="Add a timetable lesson to help everyone stay in step." action={role === 'student' ? '' : 'Add a lesson'} onClick={() => create('lesson')} />}<div className="week-note">THIS WEEK <span>Keep the week in view ↗</span></div></section>}</div><div className="callout"><span className="callout-icon">✳</span><span><b>{role === 'admin' ? 'A new school is a few clicks away' : role === 'student' ? 'Keep your progress close' : 'A little progress, every day'}</b><small>{role === 'admin' ? 'Bring a school community into your workspace.' : 'Marks, attendance and schedules, all in step.'}</small></span><button className="button secondary" onClick={() => role === 'admin' ? create('school') : changePage(role === 'student' ? 'My marks' : 'Timetable')}>{role === 'admin' ? 'Onboard a school' : role === 'student' ? 'View my marks' : 'Explore timetable'} ↗</button></div></>
+}
+
+function EmptyState({ title, text, action, onClick }) { return <div className="empty-state"><span>✳</span><b>{title}</b><p>{text}</p>{action && <button className="button secondary" onClick={onClick}>＋ {action}</button>}</div> }
+
+function Directory({ page, rows, data, search, onSearch, canManage, onEdit, onDelete }) {
+  const heading = page.replace(/^My /, '')
+  const kind = page.includes('School') ? 'school' : page.includes('Teacher') ? 'teacher' : page.includes('Student') ? 'student' : page.includes('Class') ? 'class' : page.toLowerCase().includes('timetable') ? 'lesson' : page.toLowerCase().includes('attendance') ? 'attendance' : 'mark'
+  const columns = page.includes('School') ? ['School', 'Location', 'Management login'] : page.includes('Teacher') ? ['Teacher', 'Email', 'Subject', 'Username'] : page.includes('Student') ? ['Student', 'Email', 'Class', 'Attendance'] : page.includes('Class') ? ['Class', 'Grade', 'Teachers', 'Students'] : page.toLowerCase().includes('timetable') ? ['Day', 'Time', 'Subject', 'Class'] : page.toLowerCase().includes('attendance') ? ['Date', 'Student', 'Class', 'Status'] : ['Date', 'Student', 'Subject', 'Score']
+  const value = (row, col) => ({ School: row.name, Location: row.location || '—', 'Management login': row.username, Students: data.students.filter(s => s.classId === row.id).length, Teacher: nameOf(row), Teachers: (row.teacherIds || (row.teacherId ? [row.teacherId] : [])).map(tid => nameOf(data.teachers.find(t => t.id === tid) || {})).filter(Boolean).join(', ') || '—', Email: row.email, Subject: row.subject, Username: row.username, Student: nameOf(data.students.find(s => s.id === row.studentId) || row), Class: data.classes.find(c => c.id === (row.classId || row.id))?.name || '—', Attendance: `${row.attendanceRate ?? 0}%`, Grade: row.grade, Day: row.day, Time: `${row.time || ''}${row.endTime ? `–${row.endTime}` : ''}`, Date: row.date, Status: row.status, Score: `${row.score}/${row.outOf}` })[col] ?? '—'
+  return <section className="card directory"><div className="directory-head"><div><h2>{heading}</h2><p>Manage {page.toLowerCase()} in your workspace.</p></div><label className="search">⌕ <input placeholder={`Search ${page.toLowerCase()}...`} value={search} onChange={e => onSearch(e.target.value)} /></label></div>{rows.length ? <div className="table-scroll"><table><thead><tr>{columns.map(c => <th key={c}>{c}</th>)}<th>Actions</th></tr></thead><tbody>{rows.map(row => <tr key={row.id}>{columns.map(c => <td key={c}>{c === 'School' || c === 'Teacher' || c === 'Student' ? <b>{value(row, c)}</b> : value(row, c)}</td>)}<td className="row-actions">{canManage(kind, row) ? <><button onClick={() => onEdit(kind, row)}>Edit</button><button className="delete-action" onClick={() => onDelete(kind, row)}>Delete</button></> : <span className="read-only">View only</span>}</td></tr>)}</tbody></table></div> : <EmptyState title={`No ${heading.toLowerCase()} yet`} text="Create the first record and it will appear here." />}</section>
+}
+
+function PasswordModal({ role, user, data, onClose, onSave }) {
+  const [error, setError] = useState('')
+  const submit = e => {
+    e.preventDefault()
+    const values = Object.fromEntries(new FormData(e.currentTarget))
+    const account = role === 'admin' ? { password: data.adminPassword || 'password' } : [...data.schools, ...data.teachers, ...data.students].find(x => x.id === user.id)
+    if (values.currentPassword !== account?.password) { setError('Current password is incorrect.'); return }
+    if (values.newPassword.length < 6) { setError('Use at least 6 characters for your new password.'); return }
+    if (values.newPassword !== values.confirmPassword) { setError('The new password and confirmation do not match.'); return }
+    onSave(values.newPassword)
+  }
+  return <div className="modal-shade" onMouseDown={e => e.target === e.currentTarget && onClose()}><form className="modal password-modal" onSubmit={submit}><header><div><div className="overline">ACCOUNT SETTINGS</div><h2>Change your password</h2></div><button className="close" type="button" onClick={onClose}>×</button></header><div className="modal-content"><label className="modal-field">Current password<input name="currentPassword" type="password" autoComplete="current-password" required /></label><label className="modal-field">New password<input name="newPassword" type="password" autoComplete="new-password" minLength="6" required /></label><label className="modal-field">Confirm new password<input name="confirmPassword" type="password" autoComplete="new-password" minLength="6" required /></label>{error && <div className="error">{error}</div>}</div><footer><button type="button" className="button secondary" onClick={onClose}>Cancel</button><button className="button primary">Update password</button></footer></form></div>
+}
+
+function CreateModal({ kind, data, user, role, schoolId, record, onClose, onSave }) {
+  const [form, setForm] = useState(() => ({ date: new Date().toISOString().slice(0, 10), time: '09:00', endTime: '09:45', outOf: '100', day: 'Monday', status: 'Present', schoolId: role === 'admin' ? '' : schoolId, recordedBy: nameOf(user) || user.name || 'Teacher', ...record, teacherIds: record?.teacherIds || (record?.teacherId ? [record.teacherId] : []) }))
+  const [error, setError] = useState('')
+  const patch = e => setForm(f => ({ ...f, [e.target.name]: e.target.value }))
+  const schoolClasses = data.classes.filter(c => (role === 'admin' ? c.schoolId === form.schoolId : c.schoolId === schoolId) && (role !== 'teacher' || (c.teacherIds || (c.teacherId ? [c.teacherId] : [])).includes(user.id)))
+  const schoolTeachers = data.teachers.filter(t => role === 'admin' ? t.schoolId === form.schoolId : t.schoolId === schoolId)
+  const schoolStudents = data.students.filter(s => (role === 'admin' ? s.schoolId === form.schoolId : s.schoolId === schoolId) && (role !== 'teacher' || schoolClasses.some(c => c.id === s.classId)))
+  const addField = (label, name, type = 'text', required = false, options = null) => <label className="modal-field">{label}{options ? <select required={required} name={name} value={form[name] || ''} onChange={patch}><option value="">Select {label.toLowerCase()}</option>{options.map(([v, text]) => <option key={v} value={v}>{text}</option>)}</select> : <input required={required} name={name} type={type} value={form[name] ?? ''} onChange={patch} />}</label>
+  const teacherPicker = <fieldset className="teacher-picker"><legend>Teachers for this class</legend>{schoolTeachers.length ? schoolTeachers.map(t => { const selected = form.teacherIds || []; return <label key={t.id}><input type="checkbox" checked={selected.includes(t.id)} onChange={e => setForm(f => ({ ...f, teacherIds: e.target.checked ? [...(f.teacherIds || []), t.id] : (f.teacherIds || []).filter(x => x !== t.id) }))} /><span>{nameOf(t)}</span>{t.subject && <small>{t.subject}</small>}</label> }) : <p>Add teachers to this school first.</p>}</fieldset>
+  const personFields = <><div className="form-pair">{addField('First name', 'firstName', 'text', true)}{addField('Last name', 'lastName', 'text', true)}</div>{addField('Email address', 'email', 'email', true)}{kind === 'teacher' && addField('Subject', 'subject')}{kind === 'student' && addField('Class', 'classId', 'text', false, schoolClasses.map(c => [c.id, c.name]))}<div className="form-divider">LOGIN DETAILS</div><div className="form-pair">{addField('Username', 'username', 'text', true)}{addField('Password', 'password', 'password', true)}</div></>
+  const submit = e => { e.preventDefault(); if (['school', 'teacher', 'student'].includes(kind) && (form.username === 'admin' || [...data.schools, ...data.teachers, ...data.students].some(a => a.id !== record?.id && a.username === form.username))) { setError('That username is already in use.'); return } onSave(kind, { ...form, role: kind === 'school' ? 'school' : kind, name: form.name?.trim(), teacherIds: kind === 'class' ? form.teacherIds || [] : undefined, schoolId: form.schoolId || schoolId }, record?.id) }
+  return <div className="modal-shade" onMouseDown={e => e.target === e.currentTarget && onClose()}><form className="modal" onSubmit={submit}><header><div><div className="overline">CLASSLEDGER · {record ? 'EDIT' : kind.toUpperCase()}</div><h2>{record ? `Edit ${{ school: 'school', teacher: 'teacher', student: 'student', class: 'class', lesson: 'timetable', mark: 'marks', attendance: 'attendance' }[kind]}` : { school: 'Onboard a school', teacher: 'Add a teacher', student: 'Add a student', class: 'Create a class', lesson: 'Add a timetable lesson', mark: 'Add marks', attendance: 'Take attendance' }[kind]}</h2></div><button className="close" type="button" onClick={onClose}>×</button></header><div className="modal-content">{kind === 'school' && <>{addField('School name', 'name', 'text', true)}{addField('School email', 'email', 'email', true)}{addField('Location', 'location')}<div className="form-divider">SCHOOL MANAGEMENT LOGIN</div><div className="form-pair">{addField('Username', 'username', 'text', true)}{addField('Password', 'password', 'password', true)}</div></>}{(kind === 'teacher' || kind === 'student') && <>{personFields}{role === 'admin' && addField('School', 'schoolId', 'text', true, data.schools.map(s => [s.id, s.name]))}</>}{kind === 'class' && <>{addField('Class name', 'name', 'text', true)}{addField('Grade / year', 'grade')}{role === 'admin' && addField('School', 'schoolId', 'text', true, data.schools.map(s => [s.id, s.name]))}{teacherPicker}</>}{kind === 'lesson' && <>{addField('Subject', 'subject', 'text', true)}<div className="form-pair">{addField('Day', 'day', 'text', true, ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday'].map(x => [x, x]))}{addField('Class', 'classId', 'text', true, schoolClasses.map(c => [c.id, c.name]))}</div><div className="form-pair">{addField('Starts at', 'time', 'time', true)}{addField('Ends at', 'endTime', 'time', true)}</div>{addField('Teacher', 'teacher', 'text', false, schoolTeachers.map(t => [nameOf(t), nameOf(t)]))}{role === 'admin' && addField('School', 'schoolId', 'text', true, data.schools.map(s => [s.id, s.name]))}</>}{(kind === 'mark' || kind === 'attendance') && <>{addField('Student', 'studentId', 'text', true, schoolStudents.map(s => [s.id, nameOf(s)]))}{kind === 'mark' && <>{addField('Subject', 'subject', 'text', true)}<div className="form-pair">{addField('Score', 'score', 'number', true)}{addField('Out of', 'outOf', 'number', true)}</div></>}{kind === 'attendance' && addField('Attendance status', 'status', 'text', true, ['Present', 'Absent', 'Late'].map(x => [x, x]))}<div className="form-pair">{addField('Date', 'date', 'date', true)}{kind === 'attendance' && addField('Class', 'classId', 'text', true, schoolClasses.map(c => [c.id, c.name]))}</div>{kind === 'mark' && addField('Teacher', 'teacher', 'text', false)}</>}{error && <div className="error">{error}</div>}</div><footer><button type="button" className="button secondary" onClick={onClose}>Cancel</button><button className="button primary">{record ? 'Save changes' : 'Save record'} ↗</button></footer></form></div>
+}
